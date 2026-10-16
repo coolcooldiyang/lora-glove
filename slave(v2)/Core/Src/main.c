@@ -35,11 +35,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* ===================== 从机：串口 DMA 接收 + 帧解析 + PWM 输出 =====================
+/* ===================== 从机：串口 DMA 接收 + 帧解析 + GPIO 输出 =====================
    主机每 600ms 发一帧：  CC      data      EE
                          帧头     数据      帧尾      （固定 3 字节）
-   规则：rx_data 里每有 1 个二进制 1，PA6 的 PWM 占空比就 +10%（最高 100%）
-         例：0x00 -> 0%，0x01 -> 10%，0x07 -> 30%，0x1F -> 50%，0xFF -> 80%
+   主机只发 CH4/CH5：bit3 = CH4，bit4 = CH5
+
+   规则：CH4 和 CH5 都是 1  ->  PA6 输出"亮" + 板载蓝灯 PB8 亮
+         否则               ->  PA6 输出"灭" + PB8 灭
 
    接收方式：环形缓冲 + 字节流状态机（不是"一次收固定 3 字节"）
      收到 0xCC 才当帧头、收到 0xEE 才认帧尾，中间夹进来的任何杂字节都会被丢掉，
@@ -49,25 +51,17 @@
 #define FRAME_HEAD      0xCCu   /* 帧头 */
 #define FRAME_TAIL      0xEEu   /* 帧尾 */
 
-/* ---------- PA6 = TIM3_CH1 PWM 输出（直接用寄存器配，不依赖 HAL 的 TIM 模块）----------
-   PA6 的复用：AF1 = TIM3_CH1（STM32G030 数据手册 Table 13 Port A）
-   本工程 CubeMX 里没勾 TIM，hal_conf.h 没开 HAL_TIM 模块，所以这里用寄存器配置，
-   这样既不依赖 HAL 的 TIM 驱动，CubeMX 重新生成代码也不会把它冲掉。
-   TIM3 时钟 = APB1 定时器时钟 = 64MHz
-     PSC = 64-1   -> 计数器 1MHz
-     ARR = 1000-1 -> PWM 频率 1kHz，占空比分辨率 0.1%
-   规则：rx_data 里每有 1 个二进制 1，占空比 +10%（最高 100%） */
-#define PWM_PRESCALER   (64u - 1u)
-#define PWM_PERIOD      (1000u - 1u)
-#define DUTY_PER_ONE    10u     /* rx_data 里每多 1 个 1，占空比增加 10% */
-
-/* 输出脚：PA6 —— 板子上丝印的 CH5 网络就是 PA6（ADC1_IN6） */
+/* ---------- 输出脚 PA6（板子丝印 CH5 网络）：普通 GPIO 输出 ----------
+   规则：主机发来的 CH4 和 CH5 都是 1 -> 输出"亮"电平；否则 -> 输出"灭"电平
+   默认 高电平 = 亮（接继电器模块/LED 串电阻到 GND 这类负载）；
+   如果你的灯是低电平点亮，把 OUT_ON_LEVEL / OUT_OFF_LEVEL 两个宏对调即可 */
 #define OUT_GPIO_PORT   GPIOA
 #define OUT_GPIO_PIN    GPIO_PIN_6
+#define OUT_ON_LEVEL    GPIO_PIN_SET
+#define OUT_OFF_LEVEL   GPIO_PIN_RESET
 
-/* 灯（PB8 板载蓝灯）：CH4 和 CH5 都是 1 -> 亮；否则 -> 灭
-   板载蓝灯是低电平点亮（VCC3V3→LED→1K→PB8）；如果你的板子是高电平点亮，
-   把 LED_ON_LEVEL / LED_OFF_LEVEL 两个宏对调即可 */
+/* 板载蓝灯 PB8：和 PA6 同一个条件（CH4 和 CH5 都为 1 -> 亮）
+   板载蓝灯是低电平点亮（VCC3V3→LED→1K→PB8） */
 #define LED_GPIO_PORT   GPIOB
 #define LED_GPIO_PIN    GPIO_PIN_8
 #define LED_ON_LEVEL    GPIO_PIN_RESET
@@ -117,64 +111,32 @@ void SystemClock_Config(void);
  *============================================================================*/
 
 /* 数一个字节里有几个二进制 1 */
-static uint8_t bit_count(uint8_t v)
-{
-  uint8_t cnt = 0;
-
-  while (v != 0u)
-  {
-    cnt += (uint8_t)(v & 0x01u);
-    v >>= 1;
-  }
-  return cnt;
-}
-
 /* 板载蓝灯：on != 0 点亮，否则熄灭 */
 static void out_led(uint8_t on)
 {
   HAL_GPIO_WritePin(LED_GPIO_PORT, LED_GPIO_PIN, (on != 0u) ? LED_ON_LEVEL : LED_OFF_LEVEL);
 }
 
-/* PA6 配成 TIM3_CH1 PWM 输出并启动 */
-static void out_pwm_init(void)
+/* PA6 配成普通推挽输出（不用 PWM 了），上电先输出"灭" */
+static void out_gpio_init(void)
 {
   GPIO_InitTypeDef gpio = {0};
 
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_TIM3_CLK_ENABLE();
 
-  /* PA6 -> AF1 (TIM3_CH1) */
-  gpio.Pin       = OUT_GPIO_PIN;
-  gpio.Mode      = GPIO_MODE_AF_PP;
-  gpio.Pull      = GPIO_NOPULL;
-  gpio.Speed     = GPIO_SPEED_FREQ_LOW;
-  gpio.Alternate = GPIO_AF1_TIM3;
+  gpio.Pin   = OUT_GPIO_PIN;              /* PA6 */
+  gpio.Mode  = GPIO_MODE_OUTPUT_PP;       /* 推挽输出 */
+  gpio.Pull  = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(OUT_GPIO_PORT, &gpio);
 
-  /* TIM3 寄存器配置：64MHz/(63+1)=1MHz，1MHz/(999+1)=1kHz */
-  TIM3->CR1   = 0U;                              /* 先关掉定时器再配置 */
-  TIM3->PSC   = PWM_PRESCALER;
-  TIM3->ARR   = PWM_PERIOD;
-  TIM3->CCR1  = 0U;                              /* 初始占空比 0% */
-  TIM3->CCMR1 = (0x6U << TIM_CCMR1_OC1M_Pos);    /* OC1M = 110：PWM 模式 1（不使能 CCR 预装载） */
-  TIM3->CCER  = TIM_CCER_CC1E;                   /* CC1P = 0 高电平有效；CC1E = 1 使能输出 */
-  TIM3->EGR   = TIM_EGR_UG;                      /* 产生一次更新事件，让 PSC/ARR 立即生效 */
-  TIM3->SR    = 0U;                              /* 清掉更新标志 */
-  TIM3->CR1   = TIM_CR1_CEN;                     /* 启动计数 */
+  HAL_GPIO_WritePin(OUT_GPIO_PORT, OUT_GPIO_PIN, OUT_OFF_LEVEL);   /* 上电默认"灭" */
 }
 
-/* 按 rx_data 里 1 的个数设置占空比：每多 1 个 1 加 10%，最高 100%
-   0 个 -> 0%   1 个 -> 10%   2 个 -> 20%  ...  5 个 -> 50%  ...  10 个及以上 -> 100% */
-static void out_set_duty_by_ones(uint8_t ones)
+/* PA6 输出开关：on != 0 -> 亮电平，否则 -> 灭电平 */
+static void out_write(uint8_t on)
 {
-  uint32_t full = (uint32_t)TIM3->ARR + 1U;                       /* ARR+1 = 1000，对应 100% */
-  uint32_t ccr  = (full * (uint32_t)ones * DUTY_PER_ONE) / 100U;
-
-  if (ccr > full)                        /* 超过 10 个 1 就封顶 100% */
-  {
-    ccr = full;
-  }
-  TIM3->CCR1 = ccr;                      /* 没使能预装载，写入立即生效 */
+  HAL_GPIO_WritePin(OUT_GPIO_PORT, OUT_GPIO_PIN, (on != 0u) ? OUT_ON_LEVEL : OUT_OFF_LEVEL);
 }
 
 /* 串口接收 DMA：外设(USART1->RDR) -> 内存(rx_ring)，循环模式，一直收不停 */
@@ -256,11 +218,18 @@ static void rx_poll(void)
       default:                                /* 等帧尾 */
         if (b == FRAME_TAIL)                  /* 完整有效帧 CC data EE */
         {
-          /* rx_data 里每有 1 个二进制 1，占空比 +10% */
-          out_set_duty_by_ones(bit_count(rx_data));
-
-          /* 灯：CH4 和 CH5 都是 1 -> 亮；否则 -> 灭（bit3=CH4，bit4=CH5） */
-          out_led(((rx_data & CH45_MASK) == CH45_MASK) ? 1U : 0U);
+          /* CH4 和 CH5 都是 1 -> 输出"亮"；否则 -> 输出"灭"（bit3=CH4，bit4=CH5）
+             PA6（板子丝印 CH5）和板载蓝灯 PB8 是同一个条件 */
+          if ((rx_data & CH45_MASK) == CH45_MASK)
+          {
+            out_write(1U);
+            out_led(1U);
+          }
+          else
+          {
+            out_write(0U);
+            out_led(0U);
+          }
 
           rx_st = RX_ST_HEAD;
         }
@@ -311,7 +280,7 @@ int main(void)
   MX_ADC1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  out_pwm_init();           /* PA6 配成 TIM3_CH1 PWM 输出（1kHz，初始 0%） */
+  out_gpio_init();          /* PA6 配成普通推挽输出（上电"灭"） */
   uart1_rx_dma_init();      /* 自己配一套串口接收 DMA（DMA1_Channel2，循环模式） */
   rx_start();               /* 只挂这一次，之后一直收 */
 
