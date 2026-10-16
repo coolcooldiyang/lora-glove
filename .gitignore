@@ -1,0 +1,32 @@
+# ================= Keil MDK 编译产物（不需要提交）=================
+MDK-ARM/*/
+*.o
+*.axf
+*.elf
+*.hex
+*.bin
+*.lst
+*.map
+*.dep
+*.crf
+*.d
+*.lnp
+*.iex
+*.sct
+*.htm
+*.build_log.htm
+*.bak
+*.scvd
+
+# Keil 用户界面 / 调试器设置（含本机用户名和窗口布局，不需要提交）
+*.uvguix.*
+*.uvoptx
+
+# ================= 其他 =================
+Desktop.ini
+Thumbs.db
+*.log
+
+# 说明：
+# 保留：Core/、Drivers/（HAL+CMSIS 源码，编译需要）、Middlewares/、*.ioc、
+#       *.uvprojx、启动文件、.mxproject、README.md
