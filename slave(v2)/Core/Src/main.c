@@ -65,9 +65,18 @@
 #define OUT_GPIO_PORT   GPIOA
 #define OUT_GPIO_PIN    GPIO_PIN_6
 
-/* PB8 接收指示：串口在收数据时每 200ms 翻转一次；一段时间收不到就停住、保持当前电平 */
-#define LED_BLINK_MS      200u    /* 有数据时 PB8 的翻转间隔 */
-#define LED_RX_TIMEOUT_MS 1000u   /* 超过这么久没收到数据 -> 认为“没有接收”，PB8 保持不变 */
+/* 灯（PB8 板载蓝灯）：CH4 和 CH5 都是 1 -> 亮；否则 -> 灭
+   板载蓝灯是低电平点亮（VCC3V3→LED→1K→PB8）；如果你的板子是高电平点亮，
+   把 LED_ON_LEVEL / LED_OFF_LEVEL 两个宏对调即可 */
+#define LED_GPIO_PORT   GPIOB
+#define LED_GPIO_PIN    GPIO_PIN_8
+#define LED_ON_LEVEL    GPIO_PIN_RESET
+#define LED_OFF_LEVEL   GPIO_PIN_SET
+
+/* 主机只发 CH4/CH5：bit3 = CH4，bit4 = CH5（见主机 main.c 里 bits 的拼法） */
+#define CH4_MASK        0x08u   /* bit3 */
+#define CH5_MASK        0x10u   /* bit4 */
+#define CH45_MASK       (CH4_MASK | CH5_MASK)
 
 /* 串口接收 DMA：G030 只有 DMA1_Channel1~3，Channel1 被 ADC 占了，这里用 Channel2 */
 #define RX_DMA_CHANNEL     DMA1_Channel2
@@ -93,11 +102,6 @@ static DMA_HandleTypeDef hdma_usart1_rx_sw;     /* 串口接收 DMA 句柄 */
 #define RX_ST_TAIL  2U
 static uint8_t rx_st   = RX_ST_HEAD;
 static uint8_t rx_data = 0U;
-
-/* PB8 接收指示用 */
-static uint8_t  rx_active  = 0U;                /* 1 = 最近收到过数据 */
-static uint32_t rx_tick    = 0U;                /* 最近一次收到数据的时刻 */
-static uint32_t blink_tick = 0U;                /* 最近一次翻转 PB8 的时刻 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -123,6 +127,12 @@ static uint8_t bit_count(uint8_t v)
     v >>= 1;
   }
   return cnt;
+}
+
+/* 板载蓝灯：on != 0 点亮，否则熄灭 */
+static void out_led(uint8_t on)
+{
+  HAL_GPIO_WritePin(LED_GPIO_PORT, LED_GPIO_PIN, (on != 0u) ? LED_ON_LEVEL : LED_OFF_LEVEL);
 }
 
 /* PA6 配成 TIM3_CH1 PWM 输出并启动 */
@@ -227,9 +237,7 @@ static void rx_poll(void)
       rx_read_pos = 0U;
     }
 
-    /* 串口只要收到字节就算“有接收到信息”（PB8 指示用；想只在合法帧时闪，把这两行挪到帧尾判断里） */
-    rx_tick   = HAL_GetTick();
-    rx_active = 1U;
+    /* 串口收到字节就不再需要额外处理（灯的亮灭由下面的合法帧控制） */
 
     switch (rx_st)
     {
@@ -250,6 +258,10 @@ static void rx_poll(void)
         {
           /* rx_data 里每有 1 个二进制 1，占空比 +10% */
           out_set_duty_by_ones(bit_count(rx_data));
+
+          /* 灯：CH4 和 CH5 都是 1 -> 亮；否则 -> 灭（bit3=CH4，bit4=CH5） */
+          out_led(((rx_data & CH45_MASK) == CH45_MASK) ? 1U : 0U);
+
           rx_st = RX_ST_HEAD;
         }
         else if (b == FRAME_HEAD)             /* 帧尾不对，但这个字节可能就是下一帧的帧头 */
@@ -303,37 +315,24 @@ int main(void)
   uart1_rx_dma_init();      /* 自己配一套串口接收 DMA（DMA1_Channel2，循环模式） */
   rx_start();               /* 只挂这一次，之后一直收 */
 
-  /* 上电自检：PB8 快闪 3 下（板载蓝灯低电平点亮），看到这 3 下就说明新固件在跑 */
+  /* 上电自检：PB8 快闪 3 下，看到这 3 下就说明新固件在跑；闪完停在"灭" */
   for (uint8_t i = 0U; i < 3U; i++)
   {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);   /* 亮 */
+    out_led(1U);
     HAL_Delay(100U);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);     /* 灭 */
+    out_led(0U);
     HAL_Delay(100U);
   }
-  blink_tick = HAL_GetTick();   /* 从当前时刻开始算 200ms */
+  out_led(0U);              /* 上电默认灭，之后由主机的 CH4/CH5 决定亮灭 */
 /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 把 DMA 收到的字节喂给状态机：自动找 0xCC 帧头、0xEE 帧尾 */
+    /* 把 DMA 收到的字节喂给状态机：自动找 0xCC 帧头、0xEE 帧尾；
+       收到合法帧就更新 PA6 的占空比和 PB8 的亮灭（CH4 和 CH5 都为 1 才亮） */
     rx_poll();
-
-    /* PB8 指示：还在收数据 -> 每 200ms 翻转一次；收不到了 -> 停住，保持当前电平不变 */
-    if ((rx_active != 0U) && ((HAL_GetTick() - rx_tick) < LED_RX_TIMEOUT_MS))
-    {
-      if ((HAL_GetTick() - blink_tick) >= LED_BLINK_MS)
-      {
-        blink_tick = HAL_GetTick();
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_8);
-      }
-    }
-    else
-    {
-      rx_active = 0U;       /* 超时没数据：不再翻转，PB8 就停在当前电平 */
-    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

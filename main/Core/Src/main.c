@@ -431,8 +431,10 @@ int main(void)
       /* else：落在门限附近的死区里，保持上一次状态不变 */
     }
 
-    /* 5 个通道拼成一个字节：bit0~bit4 对应 CH1~CH5 */
-    bits = (uint8_t)(glove[0] + (glove[1] << 1) + (glove[2] << 2) + (glove[3] << 3) + (glove[4] << 4));
+    /* 只发 CH4/CH5 的数据：bit3 = CH4，bit4 = CH5；CH1~CH3 不发，对应位恒为 0。
+       （★ 想改成紧凑格式 bit0=CH4、bit1=CH5，就把下面这行换成：
+           bits = (uint8_t)(glove[3] + (glove[4] << 1)); ） */
+    bits = (uint8_t)((glove[3] << 3) + (glove[4] << 4));
 
     if (key_stage != 0U)
     {
