@@ -36,12 +36,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* ===================== 从机：串口 DMA 接收 + 帧解析 + GPIO 输出 =====================
-   主机每 600ms 发一帧：  CC      data      EE
-                         帧头     数据      帧尾      （固定 3 字节）
-   主机只发 CH4/CH5：bit3 = CH4，bit4 = CH5
+   主机每 200ms 至少发一帧（状态一变立刻发）：  CC      data      EE
+                                                帧头     数据      帧尾   （固定 3 字节）
+   data 的每一位代表一路手套：bit0=CH1 … bit4=CH5（1 = 该路弯曲）
 
-   规则：CH4 和 CH5 都是 1  ->  PA6 输出"亮" + 板载蓝灯 PB8 亮
-         否则               ->  PA6 输出"灭" + PB8 灭
+   规则：data 里"二进制 1 的个数" >= BITS_ON_MIN(3)  ->  PA6 输出"亮" + 板载蓝灯 PB8 亮
+         否则（1 的个数 0~2 个）                      ->  PA6 输出"灭" + PB8 灭
 
    接收方式：环形缓冲 + 字节流状态机（不是"一次收固定 3 字节"）
      收到 0xCC 才当帧头、收到 0xEE 才认帧尾，中间夹进来的任何杂字节都会被丢掉，
@@ -52,7 +52,7 @@
 #define FRAME_TAIL      0xEEu   /* 帧尾 */
 
 /* ---------- 输出脚 PA6（板子丝印 CH5 网络）：普通 GPIO 输出 ----------
-   规则：主机发来的 CH4 和 CH5 都是 1 -> 输出"亮"电平；否则 -> 输出"灭"电平
+   规则：data 里 1 的个数 >= BITS_ON_MIN -> 输出"亮"电平；否则 -> 输出"灭"电平
    默认 高电平 = 亮（接继电器模块/LED 串电阻到 GND 这类负载）；
    如果你的灯是低电平点亮，把 OUT_ON_LEVEL / OUT_OFF_LEVEL 两个宏对调即可 */
 #define OUT_GPIO_PORT   GPIOA
@@ -60,14 +60,22 @@
 #define OUT_ON_LEVEL    GPIO_PIN_SET
 #define OUT_OFF_LEVEL   GPIO_PIN_RESET
 
-/* 板载蓝灯 PB8：和 PA6 同一个条件（CH4 和 CH5 都为 1 -> 亮）
+/* 板载蓝灯 PB8：和 PA6 同一个条件（data 里 1 的个数 >= BITS_ON_MIN -> 亮）
    板载蓝灯是低电平点亮（VCC3V3→LED→1K→PB8） */
 #define LED_GPIO_PORT   GPIOB
 #define LED_GPIO_PIN    GPIO_PIN_8
 #define LED_ON_LEVEL    GPIO_PIN_RESET
 #define LED_OFF_LEVEL   GPIO_PIN_SET
 
-/* 主机只发 CH4/CH5：bit3 = CH4，bit4 = CH5（见主机 main.c 里 bits 的拼法） */
+/* ★ 亮灯门限：data 的二进制里有几个 1
+   >= 3 -> 亮（改这个数字就能改判定条件，1~5 之间）
+   例：data=0x1C = 11100 -> 3 个 1 -> 亮；data=0x18 = 11000 -> 2 个 1 -> 灭 */
+#define BITS_ON_MIN     3u
+
+/* 各通道对应的位（仅供参考/以后要改回"某几路同时为 1"时用） */
+#define CH1_MASK        0x01u   /* bit0 */
+#define CH2_MASK        0x02u   /* bit1 */
+#define CH3_MASK        0x04u   /* bit2 */
 #define CH4_MASK        0x08u   /* bit3 */
 #define CH5_MASK        0x10u   /* bit4 */
 #define CH45_MASK       (CH4_MASK | CH5_MASK)
@@ -110,7 +118,20 @@ void SystemClock_Config(void);
  *                          从机功能代码
  *============================================================================*/
 
-/* 数一个字节里有几个二进制 1 */
+/* 数一个字节里有几个二进制 1（Kernighan 法：v &= v-1 每轮消掉最低位的 1）
+   例：0x1C(11100) -> 3 ；0x18(11000) -> 2 ；0x00 -> 0 */
+static uint8_t bit_count(uint8_t v)
+{
+  uint8_t n = 0u;
+
+  while (v != 0u)
+  {
+    v &= (uint8_t)(v - 1u);
+    n++;
+  }
+  return n;
+}
+
 /* 板载蓝灯：on != 0 点亮，否则熄灭 */
 static void out_led(uint8_t on)
 {
@@ -218,9 +239,10 @@ static void rx_poll(void)
       default:                                /* 等帧尾 */
         if (b == FRAME_TAIL)                  /* 完整有效帧 CC data EE */
         {
-          /* CH4 和 CH5 都是 1 -> 输出"亮"；否则 -> 输出"灭"（bit3=CH4，bit4=CH5）
+          /* data 的二进制里"1 的个数" >= BITS_ON_MIN(3)  -> 输出"亮"
+             否则（0~2 个 1）                            -> 输出"灭"
              PA6（板子丝印 CH5）和板载蓝灯 PB8 是同一个条件 */
-          if ((rx_data & CH45_MASK) == CH45_MASK)
+          if (bit_count(rx_data) >= BITS_ON_MIN)
           {
             out_write(1U);
             out_led(1U);
@@ -300,7 +322,7 @@ int main(void)
   while (1)
   {
     /* 把 DMA 收到的字节喂给状态机：自动找 0xCC 帧头、0xEE 帧尾；
-       收到合法帧就更新 PA6 的占空比和 PB8 的亮灭（CH4 和 CH5 都为 1 才亮） */
+       收到合法帧就更新 PA6 和 PB8（data 里 1 的个数 >= 3 才亮） */
     rx_poll();
     /* USER CODE END WHILE */
 
