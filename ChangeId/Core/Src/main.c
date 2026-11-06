@@ -42,6 +42,7 @@
  *  作用：通过串口给 HC-12 发 AT 指令，把模块的
  *          · 串口波特率 改成 4800   （AT+B4800）
  *          · 通信频道   改成 C002   （AT+C002）
+ *          · 透传模式   改成 FU1    （AT+FU1）
  *
  *  接线（板子上 USART1 已经连好了：MCU PA9(TX) -> 模块 RXD，MCU PA10(RX) <- 模块 TXD）
  *      ★ 模块的第 5 脚 SET 必须拉低才能进 AT 指令模式，二选一：
@@ -67,7 +68,7 @@
 #define HC_SET_PIN           GPIO_PIN_4
 
 #define HC_BAUD_TARGET       4800u          /* 目标波特率 */
-#define HC_CHANNEL_TARGET    "002"          /* 目标频道 -> C002 */
+#define HC_CHANNEL_TARGET    "010"          /* 目标频道 -> C002 */
 
 #define LED_PORT             GPIOB
 #define LED_PIN              GPIO_PIN_8
@@ -200,7 +201,7 @@ static uint8_t hc_find_baud(void)
   return 0u;
 }
 
-/* 配置流程：进 AT 模式 -> 找波特率 -> 改波特率/频道 -> 退出 AT 模式 */
+/* 配置流程：进 AT 模式 -> 找波特率 -> 改透传模式/波特率/频道 -> 退出 AT 模式 */
 static void hc_configure(void)
 {
   char    cmd[24];
@@ -229,13 +230,19 @@ static void hc_configure(void)
     ok = 0u;                       /* 一个波特率都不通：多半是 SET 没拉低 / 接线不对 */
   }
 
-  /* 3. 改串口波特率：AT+B4800 -> 回 OK+B4800 */
+  /* 3. 改透传模式：AT+FU1 -> 回 OK+FU1 */
+  if ((ok != 0u) && (hc_send_cmd("AT+FU1", "OK+FU1", 300u) == 0u))
+  {
+    ok = 0u;
+  }
+
+  /* 4. 改串口波特率：AT+B4800 -> 回 OK+B4800 */
   if ((ok != 0u) && (hc_send_cmd("AT+B" "4800", "OK+B", 300u) == 0u))
   {
     ok = 0u;
   }
 
-  /* 4. 改通信频道：AT+C002 -> 回 OK+C002 */
+  /* 5. 改通信频道：AT+C002 -> 回 OK+C002 */
   if (ok != 0u)
   {
     (void)snprintf(cmd, sizeof(cmd), "AT+C%s", HC_CHANNEL_TARGET);
@@ -245,13 +252,13 @@ static void hc_configure(void)
     }
   }
 
-  /* 5. 读回参数确认：AT+RX 会回 "OK+FU3 OK+B4800 OK+C002 OK+RP:+20dBm" 这样的串 */
+  /* 6. 读回参数供调试，例如 "OK+B4800 OK+RC002 OK+RP:+20dBm OK+FU1" */
   if (ok != 0u)
   {
     (void)hc_send_cmd("AT+RX", "OK+", 300u);   /* hc_rx 里会留下完整回包，调试时可以看 */
   }
 
-  /* 6. 退出 AT 指令模式：SET 拉高，模块 80ms 后回到透传模式 */
+  /* 7. 退出 AT 指令模式：SET 拉高，模块 80ms 后回到透传模式 */
 #if (HC_USE_SET_GPIO != 0)
   HAL_GPIO_WritePin(HC_SET_PORT, HC_SET_PIN, GPIO_PIN_SET);
 #endif
