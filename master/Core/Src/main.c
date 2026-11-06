@@ -100,7 +100,7 @@ static uint16_t adc_avg1[ADC_CH_NUM];      /* 第一次按下的平均值（mV�
 static uint16_t adc_avg2[ADC_CH_NUM];      /* 第二次按下的平均值（mV） */
 static uint16_t glove_off[ADC_CH_NUM] =    /* 判定门限（mV），标定前先用原来的固定值 */
 {
-  8000, 8000, 8000, 1550, 1600
+  8000, 8000, 8000, 1650, 1850
 };
 static uint8_t  key_stage = 0U;            /* 0=等第1次  1=已采第1次  2=已采第2次 */
 static uint32_t last_send_tick = 0U;       /* 上一次往从机发帧的时刻 */

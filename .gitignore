@@ -27,6 +27,9 @@ Desktop.ini
 Thumbs.db
 *.log
 
+# HC-12 厂家资料（PDF + Windows 串口助手 exe/dll，共十几 MB，只在本机留存）
+HC-12模块资料/
+
 # 说明：
 # 保留：Core/、Drivers/（HAL+CMSIS 源码，编译需要）、Middlewares/、*.ioc、
 #       *.uvprojx、启动文件、.mxproject、README.md
